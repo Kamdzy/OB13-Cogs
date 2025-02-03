@@ -24,18 +24,19 @@ SOFTWARE.
 
 import re
 import typing
-import aiohttp
-import html2text
-import feedparser
-from urllib.parse import urlparse
 from datetime import datetime, timezone
+from urllib.parse import urlparse
 
+import aiohttp
 import discord
+import feedparser
+import html2text
 from discord.ext import tasks
-from .converters import ExplicitNone
-from redbot.core import commands, Config
+from redbot.core import Config, commands
 from redbot.core.utils import AsyncIter
 from redbot.core.utils.chat_formatting import escape, pagify
+
+from .converters import ExplicitNone
 
 # Constants
 COLOR = 0x7289da
@@ -569,20 +570,44 @@ class GitHub(commands.Cog):
         return await ctx.send("Feed successfully added.")
 
     @_github.command(name="remove", aliases=["delete"])
-    async def _remove(self, ctx: commands.Context, name: str):
+    async def _remove(self, ctx: commands.Context, identifier: str):
         """Remove a GitHub RSS feed from the server."""
+
+        def is_url(input_str: str) -> bool:
+            url_regex = re.compile(
+                r'^(?:http|ftp)s?://'  # http:// or https://
+                r'(?:(?:[A-Z0-9](?:[A-Z0-9-]{0,61}[A-Z0-9])?\.)+(?:[A-Z]{2,6}\.?|[A-Z0-9-]{2,}\.?)|'  # domain...
+                r'localhost|'  # localhost...
+                r'\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}|'  # ...or ipv4
+                r'\[?[A-F0-9]*:[A-F0-9:]+\]?)'  # ...or ipv6
+                r'(?::\d+)?'  # optional port
+                r'(?:/?|[/?]\S+)$', re.IGNORECASE)
+            return re.match(url_regex, input_str) is not None
+
+        def parse_github_url(url: str) -> dict:
+            match = re.match(r'https?://github\.com/([^/]+)/([^/]+)/?', url)
+            if match:
+                return {'user': match.group(1), 'repo': match.group(2)}
+            return {}
 
         guild_config = await self.config.guild(ctx.guild).all()
         if (role := guild_config["role"]) and role not in [r.id for r in ctx.author.roles]:
             return await ctx.send(NO_ROLE)
 
-        name = self._escape(name)
-
         # Delete from config
         async with self.config.member(ctx.author).feeds() as feeds:
-            if not (to_remove := feeds.get(name)):
-                return await ctx.send(f"There is no feed with that name! Try checking your feeds with `{ctx.clean_prefix}github list`.")
-            del feeds[name]
+            if is_url(identifier):
+                user_and_repo = parse_github_url(identifier)
+                to_remove = next((feed for feed in feeds.values() if feed['user'] == user_and_repo['user'] and feed['repo'] == user_and_repo['repo']), None)
+                identifier = self._escape(identifier)
+            else:
+                identifier = self._escape(identifier)
+                to_remove = feeds.get(identifier)
+
+            if not to_remove:
+                return await ctx.send(f"There is no feed with that identifier! Try checking your feeds with `{ctx.clean_prefix}github list`.")
+            
+            del feeds[to_remove['name']]
 
         # Send confirmation
         if guild_config["notify"]:
