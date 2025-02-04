@@ -608,7 +608,13 @@ class GitHub(commands.Cog):
             if not to_remove:
                 return await ctx.send(f"There is no feed with that identifier! Try checking your feeds with `{ctx.clean_prefix}github list`.")
             
-            del feeds[identifier]
+            # del feeds[identifier]
+
+            # Remove feed using to_remove
+            for name, feed in feeds.items():
+                if feed == to_remove:
+                    del feeds[name]
+                    break
 
         # Send confirmation
         if guild_config["notify"]:
