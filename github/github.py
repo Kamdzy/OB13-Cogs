@@ -584,6 +584,7 @@ class GitHub(commands.Cog):
                 r'(?:/?|[/?]\S+)$', re.IGNORECASE)
             return re.match(url_regex, input_str) is not None
 
+        # Extract user and repo from URL
         def parse_github_url(url: str) -> dict:
             match = re.match(r'https?://github\.com/([^/]+)/([^/]+)/?', url)
             if match:
