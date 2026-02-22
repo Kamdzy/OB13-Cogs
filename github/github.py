@@ -22,6 +22,8 @@ OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
 """
 
+import asyncio
+import logging
 import re
 import typing
 from datetime import datetime, timezone
@@ -50,9 +52,14 @@ USER_REPO_BRANCH_REGEX: re.Pattern = re.compile(r"/(.*?)/(.*?)/?(commits)?/(.*?(
 LONG_COMMIT_REGEX: re.Pattern = re.compile(r"^<pre.*?>|</pre>$|(?<=\n)\n+")
 LONG_RELEASE_REGEX: re.Pattern = re.compile(r"^<pre.*?>|</pre>$|(?<=\n)\n+")
 
+# Concurrency limit for feed fetching
+FETCH_SEMAPHORE_LIMIT = 20
+
 # Error messages
 NO_ROLE = "You do not have the required role!"
 NOT_FOUND = "I could not find that feed."
+
+log = logging.getLogger("red.ob13-cogs.github")
 
 
 class GitHub(commands.Cog):
@@ -67,7 +74,7 @@ class GitHub(commands.Cog):
         self.config = Config.get_conf(self, 14000605, force_registration=True)
 
         default_global = {
-            "interval": 3
+            "interval": 30
         }
         default_guild = {
             "channel": None,
@@ -95,7 +102,7 @@ class GitHub(commands.Cog):
         global_conf = await self.config.all()
 
         # Change loop interval if necessary
-        if global_conf["interval"] != 3:
+        if global_conf["interval"] != 30:
             self._github_rss.change_interval(minutes=global_conf["interval"])
 
         # Check whether config migration is necessary
@@ -160,13 +167,20 @@ class GitHub(commands.Cog):
             return final_url + f"/commits.atom"
 
     @staticmethod
-    async def _fetch(url: str, valid_statuses: list):
-        async with aiohttp.ClientSession() as session:
+    async def _fetch(url: str, valid_statuses: list, session: aiohttp.ClientSession = None):
+        if session:
             async with session.get(url) as resp:
                 html = await resp.read()
                 if resp.status not in valid_statuses:
                     return False
-        return feedparser.parse(html)
+            return feedparser.parse(html)
+        else:
+            async with aiohttp.ClientSession() as s:
+                async with s.get(url) as resp:
+                    html = await resp.read()
+                    if resp.status not in valid_statuses:
+                        return False
+            return feedparser.parse(html)
 
     @staticmethod
     async def new_entries(entries, last_time):
@@ -272,7 +286,7 @@ class GitHub(commands.Cog):
         """
         Set the global fetch interval for GitHub.
 
-        Depending on the size of your bot, you may want to modify the interval for which the bot fetches all feeds for updates (default is 3 minutes).
+        Depending on the size of your bot, you may want to modify the interval for which the bot fetches all feeds for updates (default is 30 minutes).
         """
         await self.config.interval.set(interval_in_minutes)
         self._github_rss.change_interval(minutes=interval_in_minutes)
@@ -653,10 +667,12 @@ class GitHub(commands.Cog):
         for embed in embeds:
             await ctx.send(embed=embed)
 
-    @tasks.loop(minutes=3)
+    @tasks.loop(minutes=30)
     async def _github_rss(self, guild_to_check=None):
+        semaphore = asyncio.Semaphore(FETCH_SEMAPHORE_LIMIT)
 
-        # Loop through each guild
+        # Phase 1: Collect all feed tasks and their context
+        feed_tasks = []
         for guild_id, guild_config in (await self.config.all_guilds()).items():
 
             # Check for single guild
@@ -664,49 +680,92 @@ class GitHub(commands.Cog):
                 continue
 
             if (
-                    not (guild := self.bot.get_guild(guild_id)) or  # Bot no longer in guild
-                    not (channel := self.bot.get_channel(guild_config["channel"])) or  # Guild channel not found
-                    not channel.permissions_for(guild.me).send_messages or  # Cannot send in guild channel
-                    not channel.permissions_for(guild.me).embed_links  # Cannot embed links in guild channel
+                    not (guild := self.bot.get_guild(guild_id)) or
+                    not (channel := self.bot.get_channel(guild_config["channel"])) or
+                    not channel.permissions_for(guild.me).send_messages or
+                    not channel.permissions_for(guild.me).embed_links
             ):
                 continue
 
-            # Loop through each member
-            async for member_id, member_data in AsyncIter((await self.config.all_members(guild)).items(), steps=100):
-
-                # Loop through each feed
+            for member_id, member_data in (await self.config.all_members(guild)).items():
                 for name, feed in member_data["feeds"].items():
-                    url = await self._url_from_config(feed)
+                    feed_tasks.append({
+                        "guild_id": guild_id,
+                        "guild": guild,
+                        "guild_config": guild_config,
+                        "channel": channel,
+                        "member_id": member_id,
+                        "name": name,
+                        "feed": feed,
+                    })
 
-                    # Fetch & parse feed
-                    if not (parsed := await self._fetch(url, [200])):
-                        continue
+        if not feed_tasks:
+            return
 
-                    # Find new entries
-                    new_entries, new_time = await self.new_entries(parsed.entries, feed["time"])
+        # Phase 2: Fetch all feeds concurrently with a shared session
+        async with aiohttp.ClientSession() as session:
 
-                    # Create feed embed
-                    if e := await self._commit_embeds(
-                            entries=new_entries,
-                            feed_link=parsed.feed.link,
-                            color=guild_config["color"],
-                            timestamp=guild_config["timestamp"],
-                            short=guild_config["short"]
-                    ):
+            async def _fetch_one(task_info):
+                url = await self._url_from_config(task_info["feed"])
+                async with semaphore:
+                    try:
+                        parsed = await self._fetch(url, [200], session=session)
+                    except Exception:
+                        log.debug("Failed to fetch feed %s for member %s", task_info["name"], task_info["member_id"], exc_info=True)
+                        parsed = False
+                task_info["parsed"] = parsed
 
-                        # Get channel (guild vs feed override)
-                        ch = channel
-                        if feed["channel"]:
-                            if not ((ch := guild.get_channel(feed["channel"])) and ch.permissions_for(guild.me).send_messages and ch.permissions_for(guild.me).embed_links):
-                                ch = None
+            await asyncio.gather(*[_fetch_one(t) for t in feed_tasks], return_exceptions=True)
 
-                        # Send feed embed
-                        if ch:
-                            await ch.send(embed=e)
+        # Phase 3: Process results and collect config updates
+        time_updates = []  # (guild_id, member_id, name, new_timestamp)
 
-                        # Set time to feed config
-                        async with self.config.member_from_ids(guild_id, member_id).feeds() as member_feeds:
-                            member_feeds[name]["time"] = new_time.timestamp()
+        for task_info in feed_tasks:
+            try:
+                parsed = task_info["parsed"]
+                if not parsed:
+                    continue
+
+                feed = task_info["feed"]
+                guild_config = task_info["guild_config"]
+                guild = task_info["guild"]
+                channel = task_info["channel"]
+
+                # Find new entries
+                new_entries, new_time = await self.new_entries(parsed.entries, feed["time"])
+
+                # Create feed embed
+                if e := await self._commit_embeds(
+                        entries=new_entries,
+                        feed_link=parsed.feed.link,
+                        color=guild_config["color"],
+                        timestamp=guild_config["timestamp"],
+                        short=guild_config["short"]
+                ):
+                    # Get channel (guild vs feed override)
+                    ch = channel
+                    if feed["channel"]:
+                        if not ((ch := guild.get_channel(feed["channel"])) and ch.permissions_for(guild.me).send_messages and ch.permissions_for(guild.me).embed_links):
+                            ch = None
+
+                    # Send feed embed
+                    if ch:
+                        await ch.send(embed=e)
+
+                    # Collect time update
+                    time_updates.append((task_info["guild_id"], task_info["member_id"], task_info["name"], new_time.timestamp()))
+
+            except Exception:
+                log.error("Error processing feed %s for member %s in guild %s", task_info["name"], task_info["member_id"], task_info["guild_id"], exc_info=True)
+
+        # Phase 4: Batch config writes
+        for guild_id, member_id, name, new_timestamp in time_updates:
+            try:
+                async with self.config.member_from_ids(guild_id, member_id).feeds() as member_feeds:
+                    if name in member_feeds:
+                        member_feeds[name]["time"] = new_timestamp
+            except Exception:
+                log.error("Error updating config for feed %s, member %s, guild %s", name, member_id, guild_id, exc_info=True)
 
     @_github_rss.before_loop
     async def _before_github_rss(self):
