@@ -513,7 +513,7 @@ class GitHub(commands.Cog):
             return await ctx.send(NO_ROLE)
 
         # Filter name
-        if len(name) > 20:
+        if len(name) > 100:
             return await ctx.send("That feed name is too long!")
         name = self._escape(name)
 
